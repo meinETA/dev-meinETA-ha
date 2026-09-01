@@ -10,13 +10,15 @@ author nigl, Tidone
 
 from __future__ import annotations
 
-from datetime import time, timedelta
+from datetime import time
 import logging
+from typing import Any
 
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components.sensor import (
+    DOMAIN as SENSOR_DOMAIN,
     ENTITY_ID_FORMAT,
     SensorDeviceClass,
     SensorEntity,
@@ -25,16 +27,16 @@ from homeassistant.components.sensor import (
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.entity_platform import async_get_current_platform
 from homeassistant.helpers.typing import VolDictType
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import ETAEndpoint, ETAError, ETAValidWritableValues
 from .const import (
     CHOSEN_FLOAT_SENSORS,
     CHOSEN_TEXT_SENSORS,
     CHOSEN_WRITABLE_SENSORS,
-    CUSTOM_UNIT_MINUTES_SINCE_MIDNIGHT,
     CUSTOM_UNIT_TIMESLOT,
     CUSTOM_UNIT_TIMESLOT_PLUS_TEMPERATURE,
     DOMAIN,
@@ -47,20 +49,11 @@ from .const import (
     WRITABLE_DICT,
     WRITABLE_UPDATE_COORDINATOR,
 )
-from .coordinator import (
-    ETAErrorUpdateCoordinator,
-    ETASensorUpdateCoordinator,
-    ETAWritableUpdateCoordinator,
-)
-from .entity import (
-    EtaCoordinatedSensorEntity,
-    EtaErrorEntity,
-    EtaWritableSensorEntity,
-)
+from .coordinator import ETAErrorUpdateCoordinator, ETASensorUpdateCoordinator
+from .entity import EtaCoordinatedSensorEntity, EtaErrorEntity
 from .utils import get_native_unit
 
 _LOGGER = logging.getLogger(__name__)
-SCAN_INTERVAL = timedelta(minutes=1)
 
 WRITE_TIMESLOT_SCHEMA: VolDictType = {
     vol.Required("begin"): cv.time,
@@ -74,7 +67,9 @@ WRITE_TIMESLOT_PLUS_TEMPERATURE_SCHEMA: VolDictType = {
 }
 
 
-def _deduplicate_entities_by_unique_id(entities: list[SensorEntity]) -> list[SensorEntity]:
+def _deduplicate_entities_by_unique_id(
+    entities: list[SensorEntity],
+) -> list[SensorEntity]:
     """Drop duplicate entities with identical unique IDs.
 
     In rare edge cases a sensor can temporarily end up in multiple categories
@@ -116,39 +111,22 @@ async def async_setup_entry(
 
     chosen_float_sensors = config[CHOSEN_FLOAT_SENSORS]
     chosen_writable_sensors = config[CHOSEN_WRITABLE_SENSORS]
-    # sensors don't use a coordinator if they are not also selected as writable endpoints,
+    # first add all normal float sensors
     sensors = [
         EtaFloatSensor(
             config,
             hass,
             entity,
             config[FLOAT_DICT][entity],
-            sensor_coordinator,
+            sensor_coordinator
+            if entity + "_writable" not in chosen_writable_sensors
+            else writable_coordinator,
         )
         for entity in chosen_float_sensors
-        if entity + "_writable" not in chosen_writable_sensors
     ]
-    # sensors use a coordinator if they are also selected as writable endpoints,
-    # to be able to update the value immediately if the user writes a new value
-    # this only handles cases where a sensor is selected as both, a writable sensor and a float sensor
-    # the actual writable sensor is handled in the number entity
-    sensors.extend(
-        [
-            EtaFloatWritableSensor(
-                config,
-                hass,
-                entity,
-                config[FLOAT_DICT][entity],
-                writable_coordinator,
-            )
-            for entity in chosen_float_sensors
-            if entity + "_writable" in chosen_writable_sensors
-        ]  # pyright: ignore[reportArgumentType]
-    )
 
     chosen_text_sensors = config[CHOSEN_TEXT_SENSORS]
-    # add the text sensors which are not also writable first
-    # these entities don't use a coordinator
+    # then add the text sensors, except for the timeslot sensors which get added in a separate loop below
     sensors.extend(
         [
             EtaTextSensor(
@@ -156,31 +134,19 @@ async def async_setup_entry(
                 hass,
                 entity,
                 config[TEXT_DICT][entity],
-                sensor_coordinator,
+                sensor_coordinator
+                if entity + "_writable" not in chosen_writable_sensors
+                else writable_coordinator,
             )
             for entity in chosen_text_sensors
-            if entity + "_writable" not in chosen_writable_sensors
-            and config[TEXT_DICT][entity]["unit"]
+            if config[TEXT_DICT][entity]["unit"]
             not in [CUSTOM_UNIT_TIMESLOT, CUSTOM_UNIT_TIMESLOT_PLUS_TEMPERATURE]
         ]  # pyright: ignore[reportArgumentType]
     )
-    # use a special entity if a text sensor is also added as a writable sensor
-    # this entity uses a coordinator to update the value immediately after a user sets it in the writable (time) entity
-    sensors.extend(
-        [
-            EtaTimeWritableSensor(
-                config,
-                hass,
-                entity,
-                config[TEXT_DICT][entity],
-                writable_coordinator,
-            )
-            for entity in chosen_text_sensors
-            if entity + "_writable" in chosen_writable_sensors
-            and config[TEXT_DICT][entity]["unit"] == CUSTOM_UNIT_MINUTES_SINCE_MIDNIGHT
-        ]  # pyright: ignore[reportArgumentType]
-    )
     # add the non-writable timeslot sensors first
+    # breaking change: all timeslot sensors which are also selected as writable sensors will now be ignored
+    # this leads to these sensors never being added to HA even if the user selects the "add all entities" option in the config or options flows.
+    # This was done because their value representation is the same as the writable timeslot sensors, leading to duplicate entities with the same value
     sensors.extend(
         [
             EtaTimeslotSensor(
@@ -190,6 +156,7 @@ async def async_setup_entry(
                 config[TEXT_DICT][entity],
                 sensor_coordinator,
                 should_activate_service=False,
+                should_be_disabled=entity + "_writable" in chosen_writable_sensors,
             )
             for entity in chosen_text_sensors
             if config[TEXT_DICT][entity]["unit"]
@@ -223,7 +190,7 @@ async def async_setup_entry(
     )
     # Final safety net: avoid HA startup failures if config data still contains
     # the same unique_id in multiple sensor categories.
-    sensors = _deduplicate_entities_by_unique_id(sensors)
+    sensors = _deduplicate_entities_by_unique_id(sensors)  # pyright: ignore[reportArgumentType]
     async_add_entities(sensors, update_before_add=False)
 
     # activate the service for all selected writable sensors with the unit CUSTOM_UNIT_TIMESLOT
@@ -269,6 +236,8 @@ def _determine_device_class(unit):
         "mV": SensorDeviceClass.VOLTAGE,
         "s": SensorDeviceClass.DURATION,
         "%rH": SensorDeviceClass.HUMIDITY,
+        "m³": SensorDeviceClass.VOLUME,
+        "m³/h": SensorDeviceClass.VOLUME_FLOW_RATE,
     }
 
     if unit in unit_dict_eta:
@@ -277,7 +246,7 @@ def _determine_device_class(unit):
     return None
 
 
-def _coerce_numeric_value(value: float | int | str | None) -> float | None:
+def _coerce_numeric_value(value: float | str | None) -> float | None:
     """Convert ETA values for numeric sensors, or return None if not numeric.
 
     ETA may temporarily return text placeholders (e.g. "---", "Aus") for
@@ -310,9 +279,9 @@ class EtaFloatSensor(SensorEntity, EtaCoordinatedSensorEntity[float]):
         hass: HomeAssistant,
         unique_id: str,
         endpoint_info: ETAEndpoint,
-        coordinator: ETASensorUpdateCoordinator,
+        coordinator: DataUpdateCoordinator[dict[str, Any]],
     ) -> None:
-        _LOGGER.info("ETA Integration - init float sensor")
+        _LOGGER.debug("ETA Integration - init float sensor")
 
         super().__init__(
             coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
@@ -327,50 +296,11 @@ class EtaFloatSensor(SensorEntity, EtaCoordinatedSensorEntity[float]):
         else:
             self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    def handle_data_updates(self, data: float | str) -> None:  # noqa: D102
+    def handle_data_updates(self, data: float | str | None) -> None:  # noqa: D102
         numeric_value = _coerce_numeric_value(data)
         if numeric_value is None:
-            _LOGGER.debug(
+            _LOGGER.info(
                 "Sensor %s received non-numeric value '%s'; setting state to unavailable",
-                self.entity_id,
-                data,
-            )
-            self._attr_native_value = None
-            return
-        self._attr_native_value = numeric_value
-
-
-class EtaFloatWritableSensor(SensorEntity, EtaWritableSensorEntity):
-    """Representation of a Float Sensor with a coordinator."""
-
-    def __init__(  # noqa: D107
-        self,
-        config: dict,
-        hass: HomeAssistant,
-        unique_id: str,
-        endpoint_info: ETAEndpoint,
-        coordinator: ETAWritableUpdateCoordinator,
-    ) -> None:
-        _LOGGER.info("ETA Integration - init float sensor with coordinator")
-
-        super().__init__(
-            coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
-        )
-
-        self._attr_device_class = _determine_device_class(endpoint_info["unit"])
-
-        self._attr_native_unit_of_measurement = get_native_unit(endpoint_info["unit"])
-
-        if self._attr_device_class == SensorDeviceClass.ENERGY:
-            self._attr_state_class = SensorStateClass.TOTAL_INCREASING
-        else:
-            self._attr_state_class = SensorStateClass.MEASUREMENT
-
-    def handle_data_updates(self, data: float | str) -> None:  # noqa: D102
-        numeric_value = _coerce_numeric_value(data)
-        if numeric_value is None:
-            _LOGGER.debug(
-                "Writable sensor %s received non-numeric value '%s'; setting state to unavailable",
                 self.entity_id,
                 data,
             )
@@ -388,15 +318,20 @@ class EtaTextSensor(SensorEntity, EtaCoordinatedSensorEntity[str]):
         hass: HomeAssistant,
         unique_id: str,
         endpoint_info: ETAEndpoint,
-        coordinator: ETASensorUpdateCoordinator,
+        coordinator: DataUpdateCoordinator[dict[str, Any]],
     ) -> None:
-        _LOGGER.info("ETA Integration - init text sensor")
+        _LOGGER.debug("ETA Integration - init text sensor")
 
         super().__init__(
             coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
         )
 
-    def handle_data_updates(self, data: str) -> None:  # noqa: D102
+    def handle_data_updates(self, data: str | None) -> None:  # noqa: D102
+        if data is None:
+            _LOGGER.info(
+                "Sensor %s received None value; setting state to unavailable",
+                self.entity_id,
+            )
         self._attr_native_value = data
 
 
@@ -411,14 +346,23 @@ class EtaTimeslotSensor(SensorEntity, EtaCoordinatedSensorEntity[str]):
         endpoint_info: ETAEndpoint,
         coordinator: ETASensorUpdateCoordinator,
         should_activate_service: bool,
+        should_be_disabled: bool = False,
     ) -> None:
-        _LOGGER.info("ETA Integration - init timeslot sensor")
+        _LOGGER.debug("ETA Integration - init timeslot sensor")
 
         self.temperature_unit = "°C"
         super().__init__(
             coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
         )
         self.valid_values: ETAValidWritableValues = endpoint_info["valid_values"]  # pyright: ignore[reportAttributeAccessIssue]
+
+        if should_be_disabled:
+            entity_registry = er.async_get(hass)
+            # Remove the entity from the list of deleted entities to allow re-adding it as disabled
+            entity_registry.deleted_entities.pop(
+                (SENSOR_DOMAIN, DOMAIN, unique_id), None
+            )
+            self._attr_entity_registry_enabled_default = False
 
         # Set supported features based on unit type and writability
         if should_activate_service:
@@ -518,7 +462,15 @@ class EtaTimeslotSensor(SensorEntity, EtaCoordinatedSensorEntity[str]):
 
         return start_time, end_time, optional_value
 
-    def handle_data_updates(self, data: str) -> None:  # noqa: D102
+    def handle_data_updates(self, data: str | None) -> None:  # noqa: D102
+        if data is None:
+            _LOGGER.info(
+                "Sensor %s received None value; setting state to unavailable",
+                self.entity_id,
+            )
+            self._attr_native_value = None
+            return
+
         start_time, end_time, temperature = self._parse_timeslot_value(str(data))
 
         if start_time == "" or end_time == "":
@@ -531,33 +483,6 @@ class EtaTimeslotSensor(SensorEntity, EtaCoordinatedSensorEntity[str]):
             )
         else:
             self._attr_native_value = f"{start_time} - {end_time}"
-
-
-class EtaTimeWritableSensor(SensorEntity, EtaWritableSensorEntity):
-    """Representation of a Text Sensor (displaying a time) with a coordinator."""
-
-    def __init__(  # noqa: D107
-        self,
-        config: dict,
-        hass: HomeAssistant,
-        unique_id: str,
-        endpoint_info: ETAEndpoint,
-        coordinator: ETAWritableUpdateCoordinator,
-    ) -> None:
-        _LOGGER.info("ETA Integration - init text sensor with coordinator")
-
-        super().__init__(
-            coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
-        )
-
-    def handle_data_updates(self, data: float) -> None:  # noqa: D102
-        # the coordinator returns the minutes since midnight, not the textual representation
-        # so we have to calculate the textual representation here
-        total_minutes = int(data)
-        hours = total_minutes // 60
-        minutes = total_minutes % 60
-
-        self._attr_native_value = f"{hours:02d}:{minutes:02d}"
 
 
 class EtaNbrErrorsSensor(SensorEntity, EtaErrorEntity):

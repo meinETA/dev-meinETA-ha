@@ -5,8 +5,10 @@ version detection and routing to the appropriate sensor discovery implementation
 """
 
 import asyncio
+from collections.abc import Callable
 import logging
 
+from aiohttp import ClientSession
 from packaging import version
 import xmltodict
 
@@ -38,17 +40,19 @@ class EtaAPI:
 
     def __init__(
         self,
-        session,
-        host,
-        port,
-        max_concurrent_requests=5,
-        request_semaphore=None,
+        session: ClientSession,
+        host: str,
+        port: int,
+        max_concurrent_requests: int = 5,
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         """Initialize the ETA API.
 
         :param session: aiohttp ClientSession for HTTP requests
         :param host: Hostname or IP address of the ETA device
         :param port: Port number of the ETA API
+        :param max_concurrent_requests: Maximum number of concurrent API requests
+        :param request_semaphore: asyncio.Semaphore to limit concurrent requests
         """
         self._http = APIClient(
             session,
@@ -59,8 +63,15 @@ class EtaAPI:
         )
 
     async def get_all_sensors(
-        self, force_legacy_mode, float_dict, switches_dict, text_dict, writable_dict
-    ):
+        self,
+        force_legacy_mode: bool,
+        float_dict: dict,
+        switches_dict: dict,
+        text_dict: dict,
+        writable_dict: dict,
+        pending_dict: dict,
+        progress_callback: Callable[[str, float | None], None] | None = None,
+    ) -> bool:
         """Enumerate all possible sensors on the ETA API.
 
         Automatically routes to the appropriate version implementation based on
@@ -71,19 +82,62 @@ class EtaAPI:
         :param switches_dict: Dictionary which will be filled with all switch sensors
         :param text_dict: Dictionary which will be filled with all text sensors
         :param writable_dict: Dictionary which will be filled with all writable sensors
+        :param pending_dict: Dictionary which will be filled with pending sensors (v1.2 only)
+        :param progress_callback: Optional callback to report progress, takes a message and a progress value between 0 and 1
+        :return: True if the new API version was used, false if the legacy discovery mode was used
+        :rtype: boolean
         """
-        if not force_legacy_mode and await self.is_correct_api_version():
+        if progress_callback is not None:
+            progress_callback("Checking ETA API version", 0.01)
+
+        is_new_api = False
+        if not force_legacy_mode:
+            try:
+                # Avoid long "no progress" stalls before discovery starts.
+                is_new_api = await asyncio.wait_for(
+                    self.is_correct_api_version(), timeout=20
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "ETA API version check timed out after 20s, falling back to legacy discovery mode"
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        "API version check timed out, using compatibility discovery",
+                        0.03,
+                    )
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "ETA API version check failed, falling back to legacy discovery mode",
+                    exc_info=True,
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        "API version check failed, using compatibility discovery",
+                        0.03,
+                    )
+
+        if is_new_api:
             # New version with varinfo endpoint detected
-            sensor_discovery = SensorDiscoveryV12(self._http)
+            if progress_callback is not None:
+                progress_callback("Using ETA API v1.2 discovery mode", 0.05)
+            sensor_discovery = SensorDiscoveryV12(
+                self._http, progress_callback=progress_callback
+            )
             await sensor_discovery.get_all_sensors(
-                float_dict, switches_dict, text_dict, writable_dict
+                float_dict, switches_dict, text_dict, writable_dict, pending_dict
             )
         else:
             # varinfo not available -> fall back to compatibility mode
-            sensor_discovery = SensorDiscoveryV11(self._http)
-            await sensor_discovery.get_all_sensors(
-                float_dict, switches_dict, text_dict, writable_dict
+            if progress_callback is not None:
+                progress_callback("Using ETA compatibility discovery mode", 0.05)
+            sensor_discovery = SensorDiscoveryV11(
+                self._http, progress_callback=progress_callback
             )
+            await sensor_discovery.get_all_sensors(
+                float_dict, switches_dict, text_dict, writable_dict, pending_dict
+            )
+        return is_new_api
 
     async def does_endpoint_exists(self):
         """Returns true if the ETA API is accessible."""
@@ -111,7 +165,10 @@ class EtaAPI:
         return eta_version >= required_version
 
     async def get_data(
-        self, uri, force_number_handling=False, force_string_handling=False
+        self,
+        uri: str,
+        force_number_handling: bool = False,
+        force_string_handling: bool = False,
     ):
         """Request the data from a API URL.
 
@@ -152,7 +209,7 @@ class EtaAPI:
 
         return self._http.parse_errors(data)
 
-    async def get_switch_state(self, uri):
+    async def get_switch_state(self, uri: str):
         """Get the raw state of a switch sensor.
 
         :param uri: URL suffix of the switch sensor
@@ -171,18 +228,12 @@ class EtaAPI:
         :return: Mapping from URI to raw switch state (or exception)
         :rtype: Dict[str, Any]
         """
-        semaphore = asyncio.Semaphore(self._http.max_concurrent_requests)
-
-        async def fetch_state_limited(uri: str):
-            async with semaphore:
-                return await self.get_switch_state(uri)
-
-        tasks = [fetch_state_limited(uri) for uri in switch_uris]
+        tasks = [self.get_switch_state(uri) for uri in switch_uris]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         return dict(zip(switch_uris, results, strict=False))
 
-    async def set_switch_state(self, uri, state):
+    async def set_switch_state(self, uri: str, state: int):
         """Set the state of a switch sensor.
 
         :param uri: URL suffix of the switch sensor
@@ -206,7 +257,13 @@ class EtaAPI:
 
         return False
 
-    async def write_endpoint(self, uri, value=None, begin=None, end=None):
+    async def write_endpoint(
+        self,
+        uri: str,
+        value: float | None = None,
+        begin: int | None = None,
+        end: int | None = None,
+    ):
         """Writa a raw value to a writable sensor.
 
         :param uri: URL suffix of the writable sensor

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import time, timedelta
+from datetime import time
 import logging
 
 from homeassistant import config_entries
 from homeassistant.components.time import ENTITY_ID_FORMAT, TimeEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
@@ -19,11 +20,9 @@ from .const import (
     WRITABLE_UPDATE_COORDINATOR,
 )
 from .coordinator import ETAWritableUpdateCoordinator
-from .entity import EtaWritableSensorEntity
+from .entity import EtaCoordinatedSensorEntity
 
 _LOGGER = logging.getLogger(__name__)
-
-SCAN_INTERVAL = timedelta(minutes=1)
 
 
 async def async_setup_entry(
@@ -45,7 +44,7 @@ async def async_setup_entry(
     async_add_entities(time_sensors, update_before_add=True)
 
 
-class EtaTime(TimeEntity, EtaWritableSensorEntity):
+class EtaTime(TimeEntity, EtaCoordinatedSensorEntity[str]):
     """Representation of a Time Sensor."""
 
     def __init__(  # noqa: D107
@@ -56,23 +55,28 @@ class EtaTime(TimeEntity, EtaWritableSensorEntity):
         endpoint_info: ETAEndpoint,
         coordinator: ETAWritableUpdateCoordinator,
     ) -> None:
-        _LOGGER.info("ETA Integration - init time sensor")
+        _LOGGER.debug("ETA Integration - init time sensor")
 
         super().__init__(
             coordinator, config, hass, unique_id, endpoint_info, ENTITY_ID_FORMAT
         )
 
+        self._attr_entity_category = EntityCategory.CONFIG
+
         # set an initial value to avoid errors. This will be overwritten by the coordinator immediately after initialization.
         self._attr_native_value = time(hour=19)
-        self._attr_should_poll = True
 
-    def handle_data_updates(self, data: float) -> None:
+    def handle_data_updates(self, data: str | None) -> None:
         """Calculate the actual time from the minutes since midnight and set the entity's value."""
-        total_minutes = int(data)
-        hours = total_minutes // 60
-        minutes = total_minutes % 60
-
-        self._attr_native_value = time(hour=hours, minute=minutes)
+        if data is None:
+            _LOGGER.info(
+                "Sensor %s received None value; setting state to unavailable",
+                self.entity_id,
+            )
+            self._attr_native_value = None
+            return
+        parsed_time = time.fromisoformat(data)
+        self._attr_native_value = parsed_time
 
     async def async_set_value(self, value: time):
         """Calculate the minutes since midnight and write the value to the endpoint."""

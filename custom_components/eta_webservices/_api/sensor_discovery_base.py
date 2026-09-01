@@ -1,6 +1,7 @@
 """Abstract base class for sensor discovery implementations."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 from ..const import CUSTOM_UNITS  # noqa: TID252
 from .api_client import APIClient
@@ -10,13 +11,24 @@ from .types import FLOAT_SENSOR_UNITS, ETAEndpoint
 class SensorDiscoveryBase(ABC):
     """Abstract base class for version-specific sensor discovery."""
 
-    def __init__(self, http_client: APIClient) -> None:
+    def __init__(
+        self,
+        http_client: APIClient,
+        progress_callback: Callable[[str, float | None], None] | None = None,
+    ) -> None:
         """Initialize sensor discovery.
 
         :param http_client: HTTPClient instance for API calls
-        :param api_instance: Reference to parent EtaAPI instance
+        :param progress_callback: Optional callback for progress updates
         """
         self._http = http_client
+        self._progress_callback = progress_callback
+
+    def _emit_progress(self, message: str, progress: float | None = None) -> None:
+        """Emit discovery progress update if a callback is registered."""
+        if self._progress_callback is None:
+            return
+        self._progress_callback(message, progress)
 
     # Concrete methods (shared by all versions)
 
@@ -71,6 +83,7 @@ class SensorDiscoveryBase(ABC):
         switches_dict: dict,
         text_dict: dict,
         writable_dict: dict,
+        pending_dict: dict,
     ):
         """Discover and enumerate all sensors.
 
@@ -78,4 +91,5 @@ class SensorDiscoveryBase(ABC):
         :param switches_dict: Dictionary to fill with switch sensors
         :param text_dict: Dictionary to fill with text sensors
         :param writable_dict: Dictionary to fill with writable sensors
+        :param pending_dict: Dictionary to fill with pending sensors (v1.2 only)
         """
