@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant import config_entries, core
 from homeassistant.const import Platform
+from homeassistant.helpers import issue_registry as ir
 
 from .const import (
     CHOSEN_FLOAT_SENSORS,
@@ -82,6 +83,8 @@ async def async_setup_entry(
 
     # Forward the setup to the sensor platform.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    _create_repository_moved_issue(hass)
 
     await async_setup_services(hass, entry)
 
@@ -198,3 +201,16 @@ async def async_unload_entry(
         hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
+
+
+def _create_repository_moved_issue(hass: core.HomeAssistant) -> None:
+    """Warn the user that this integration has moved to a new repository."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "repository_moved",
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="repository_moved",
+        learn_more_url="https://github.com/meinETA/homeassistant-eta",
+    )
